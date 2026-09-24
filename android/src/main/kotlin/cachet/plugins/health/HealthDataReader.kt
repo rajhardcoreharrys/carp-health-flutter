@@ -594,50 +594,77 @@ class HealthDataReader(
 
         for (rec in filteredRecords) {
             val record = rec as ExerciseSessionRecord
-            
-            // Get distance data
-            val distanceRequest = healthConnectClient.readRecords(
-                ReadRecordsRequest(
-                    recordType = DistanceRecord::class,
-                    timeRangeFilter = TimeRangeFilter.between(
-                        record.startTime,
-                        record.endTime,
-                    ),
-                ),
-            )
+
+            // Get distance data. Caught individually: a denied READ_DISTANCE
+            // permission should only leave totalDistance null, not abort the
+            // whole workout read (see totalEnergyBurned/totalSteps below).
             var totalDistance = 0.0
-            for (distanceRec in distanceRequest.records) {
-                totalDistance += distanceRec.distance.inMeters
+            try {
+                val distanceRequest = healthConnectClient.readRecords(
+                    ReadRecordsRequest(
+                        recordType = DistanceRecord::class,
+                        timeRangeFilter = TimeRangeFilter.between(
+                            record.startTime,
+                            record.endTime,
+                        ),
+                    ),
+                )
+                for (distanceRec in distanceRequest.records) {
+                    totalDistance += distanceRec.distance.inMeters
+                }
+            } catch (e: SecurityException) {
+                Log.i(
+                    "FLUTTER_HEALTH",
+                    "Skipping distance enrichment for workout ${record.metadata.id}: ${e.message}"
+                )
             }
 
-            // Get energy burned data
-            val energyBurnedRequest = healthConnectClient.readRecords(
-                ReadRecordsRequest(
-                    recordType = TotalCaloriesBurnedRecord::class,
-                    timeRangeFilter = TimeRangeFilter.between(
-                        record.startTime,
-                        record.endTime,
-                    ),
-                ),
-            )
+            // Get energy burned data. Caught individually: we don't request
+            // READ_TOTAL_CALORIES_BURNED, so this always throws on Android -
+            // it must not abort the workout read, only leave the field null.
             var totalEnergyBurned = 0.0
-            for (energyBurnedRec in energyBurnedRequest.records) {
-                totalEnergyBurned += energyBurnedRec.energy.inKilocalories
+            try {
+                val energyBurnedRequest = healthConnectClient.readRecords(
+                    ReadRecordsRequest(
+                        recordType = TotalCaloriesBurnedRecord::class,
+                        timeRangeFilter = TimeRangeFilter.between(
+                            record.startTime,
+                            record.endTime,
+                        ),
+                    ),
+                )
+                for (energyBurnedRec in energyBurnedRequest.records) {
+                    totalEnergyBurned += energyBurnedRec.energy.inKilocalories
+                }
+            } catch (e: SecurityException) {
+                Log.i(
+                    "FLUTTER_HEALTH",
+                    "Skipping energy-burned enrichment for workout ${record.metadata.id}: ${e.message}"
+                )
             }
 
-            // Get steps data
-            val stepRequest = healthConnectClient.readRecords(
-                ReadRecordsRequest(
-                    recordType = StepsRecord::class,
-                    timeRangeFilter = TimeRangeFilter.between(
-                        record.startTime,
-                        record.endTime
-                    ),
-                ),
-            )
+            // Get steps data. Caught individually: we don't request
+            // READ_STEPS, so this always throws on Android - it must not
+            // abort the workout read, only leave the field null.
             var totalSteps = 0.0
-            for (stepRec in stepRequest.records) {
-                totalSteps += stepRec.count
+            try {
+                val stepRequest = healthConnectClient.readRecords(
+                    ReadRecordsRequest(
+                        recordType = StepsRecord::class,
+                        timeRangeFilter = TimeRangeFilter.between(
+                            record.startTime,
+                            record.endTime
+                        ),
+                    ),
+                )
+                for (stepRec in stepRequest.records) {
+                    totalSteps += stepRec.count
+                }
+            } catch (e: SecurityException) {
+                Log.i(
+                    "FLUTTER_HEALTH",
+                    "Skipping steps enrichment for workout ${record.metadata.id}: ${e.message}"
+                )
             }
 
             // Add final datapoint
