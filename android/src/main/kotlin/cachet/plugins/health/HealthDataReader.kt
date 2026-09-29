@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Handler
 import android.util.Log
 import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.aggregate.AggregateMetric
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.*
 import androidx.health.connect.client.records.ExerciseRouteResult.ConsentRequired
@@ -21,7 +22,6 @@ import kotlinx.coroutines.launch
 import java.time.Duration
 import java.time.Instant
 import java.time.temporal.ChronoUnit
-import kotlin.reflect.KClass
 
 /**
  * Handles reading and querying health data from Health Connect.
@@ -571,37 +571,52 @@ class HealthDataReader(
     }
 
     /**
-     * Sums [value] over the [recordType] records within [session]'s time range.
+     * Totals [metric] over [session]'s time range using Health Connect's
+     * aggregate API rather than a raw sum of records.
      *
-     * Only records written by the session's own app are counted, so another
-     * app (or the phone's own activity tracking) recording the same activity
-     * doesn't double the total. If the session's app wrote none, falls back to
-     * the single other app with the largest total rather than summing across
-     * apps.
+     * A raw sum only counts records fully contained in the session's exact
+     * start/end instants, so a companion record that starts or ends outside
+     * that window by even a second is missed entirely - the workout then
+     * shows no distance at all. Aggregating prorates any record that merely
+     * overlaps the window, so a genuine partial reading is still counted.
+     *
+     * Only the session's own app is counted first, so another app (or the
+     * phone's own activity tracking) recording the same activity doesn't
+     * double the total. If the session's app contributed nothing for this
+     * metric, falls back to the single other app with the largest total
+     * rather than summing across apps - summing every app's total is what
+     * caused a Garmin run to be reported at roughly double its actual
+     * distance.
      */
-    private suspend fun <T : Record> sumCompanionRecords(
-        recordType: KClass<T>,
+    private suspend fun <T : Any> aggregateCompanionTotal(
+        metric: AggregateMetric<T>,
         session: ExerciseSessionRecord,
-        value: (T) -> Double,
+        toDouble: (T) -> Double,
     ): Double {
         val timeRange = TimeRangeFilter.between(session.startTime, session.endTime)
-        val sessionOriginRecords = healthConnectClient.readRecords(
-            ReadRecordsRequest(
-                recordType = recordType,
+
+        val ownResult = healthConnectClient.aggregate(
+            AggregateRequest(
+                metrics = setOf(metric),
                 timeRangeFilter = timeRange,
                 dataOriginFilter = setOf(session.metadata.dataOrigin),
             ),
-        ).records
-        if (sessionOriginRecords.isNotEmpty()) {
-            return sessionOriginRecords.sumOf(value)
-        }
+        )[metric]
+        if (ownResult != null) return toDouble(ownResult)
 
-        return healthConnectClient.readRecords(
-            ReadRecordsRequest(recordType = recordType, timeRangeFilter = timeRange),
-        ).records
-            .groupBy { it.metadata.dataOrigin.packageName }
-            .values
-            .maxOfOrNull { records -> records.sumOf(value) } ?: 0.0
+        val otherOrigins = healthConnectClient.aggregate(
+            AggregateRequest(metrics = setOf(metric), timeRangeFilter = timeRange),
+        ).dataOrigins.minus(session.metadata.dataOrigin)
+
+        return otherOrigins.mapNotNull { origin ->
+            healthConnectClient.aggregate(
+                AggregateRequest(
+                    metrics = setOf(metric),
+                    timeRangeFilter = timeRange,
+                    dataOriginFilter = setOf(origin),
+                ),
+            )[metric]?.let(toDouble)
+        }.maxOrNull() ?: 0.0
     }
 
     /**
@@ -635,9 +650,10 @@ class HealthDataReader(
             // whole workout read (see totalEnergyBurned/totalSteps below).
             var totalDistance = 0.0
             try {
-                totalDistance = sumCompanionRecords(DistanceRecord::class, record) {
-                    it.distance.inMeters
-                }
+                totalDistance = aggregateCompanionTotal(
+                    DistanceRecord.DISTANCE_TOTAL,
+                    record,
+                ) { it.inMeters }
             } catch (e: SecurityException) {
                 Log.i(
                     "FLUTTER_HEALTH",
@@ -650,10 +666,10 @@ class HealthDataReader(
             // it must not abort the workout read, only leave the field null.
             var totalEnergyBurned = 0.0
             try {
-                totalEnergyBurned =
-                    sumCompanionRecords(TotalCaloriesBurnedRecord::class, record) {
-                        it.energy.inKilocalories
-                    }
+                totalEnergyBurned = aggregateCompanionTotal(
+                    TotalCaloriesBurnedRecord.ENERGY_TOTAL,
+                    record,
+                ) { it.inKilocalories }
             } catch (e: SecurityException) {
                 Log.i(
                     "FLUTTER_HEALTH",
@@ -666,9 +682,10 @@ class HealthDataReader(
             // abort the workout read, only leave the field null.
             var totalSteps = 0.0
             try {
-                totalSteps = sumCompanionRecords(StepsRecord::class, record) {
-                    it.count.toDouble()
-                }
+                totalSteps = aggregateCompanionTotal(
+                    StepsRecord.COUNT_TOTAL,
+                    record,
+                ) { it.toDouble() }
             } catch (e: SecurityException) {
                 Log.i(
                     "FLUTTER_HEALTH",
