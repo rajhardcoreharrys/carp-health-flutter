@@ -21,6 +21,7 @@ import kotlinx.coroutines.launch
 import java.time.Duration
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import kotlin.reflect.KClass
 
 /**
  * Handles reading and querying health data from Health Connect.
@@ -570,6 +571,40 @@ class HealthDataReader(
     }
 
     /**
+     * Sums [value] over the [recordType] records within [session]'s time range.
+     *
+     * Only records written by the session's own app are counted, so another
+     * app (or the phone's own activity tracking) recording the same activity
+     * doesn't double the total. If the session's app wrote none, falls back to
+     * the single other app with the largest total rather than summing across
+     * apps.
+     */
+    private suspend fun <T : Record> sumCompanionRecords(
+        recordType: KClass<T>,
+        session: ExerciseSessionRecord,
+        value: (T) -> Double,
+    ): Double {
+        val timeRange = TimeRangeFilter.between(session.startTime, session.endTime)
+        val sessionOriginRecords = healthConnectClient.readRecords(
+            ReadRecordsRequest(
+                recordType = recordType,
+                timeRangeFilter = timeRange,
+                dataOriginFilter = setOf(session.metadata.dataOrigin),
+            ),
+        ).records
+        if (sessionOriginRecords.isNotEmpty()) {
+            return sessionOriginRecords.sumOf(value)
+        }
+
+        return healthConnectClient.readRecords(
+            ReadRecordsRequest(recordType = recordType, timeRangeFilter = timeRange),
+        ).records
+            .groupBy { it.metadata.dataOrigin.packageName }
+            .values
+            .maxOfOrNull { records -> records.sumOf(value) } ?: 0.0
+    }
+
+    /**
      * Handles special processing for workout/exercise session data.
      * Enriches workout records with associated distance, energy, and step data
      * by querying related records within the workout time period.
@@ -600,17 +635,8 @@ class HealthDataReader(
             // whole workout read (see totalEnergyBurned/totalSteps below).
             var totalDistance = 0.0
             try {
-                val distanceRequest = healthConnectClient.readRecords(
-                    ReadRecordsRequest(
-                        recordType = DistanceRecord::class,
-                        timeRangeFilter = TimeRangeFilter.between(
-                            record.startTime,
-                            record.endTime,
-                        ),
-                    ),
-                )
-                for (distanceRec in distanceRequest.records) {
-                    totalDistance += distanceRec.distance.inMeters
+                totalDistance = sumCompanionRecords(DistanceRecord::class, record) {
+                    it.distance.inMeters
                 }
             } catch (e: SecurityException) {
                 Log.i(
@@ -624,18 +650,10 @@ class HealthDataReader(
             // it must not abort the workout read, only leave the field null.
             var totalEnergyBurned = 0.0
             try {
-                val energyBurnedRequest = healthConnectClient.readRecords(
-                    ReadRecordsRequest(
-                        recordType = TotalCaloriesBurnedRecord::class,
-                        timeRangeFilter = TimeRangeFilter.between(
-                            record.startTime,
-                            record.endTime,
-                        ),
-                    ),
-                )
-                for (energyBurnedRec in energyBurnedRequest.records) {
-                    totalEnergyBurned += energyBurnedRec.energy.inKilocalories
-                }
+                totalEnergyBurned =
+                    sumCompanionRecords(TotalCaloriesBurnedRecord::class, record) {
+                        it.energy.inKilocalories
+                    }
             } catch (e: SecurityException) {
                 Log.i(
                     "FLUTTER_HEALTH",
@@ -648,17 +666,8 @@ class HealthDataReader(
             // abort the workout read, only leave the field null.
             var totalSteps = 0.0
             try {
-                val stepRequest = healthConnectClient.readRecords(
-                    ReadRecordsRequest(
-                        recordType = StepsRecord::class,
-                        timeRangeFilter = TimeRangeFilter.between(
-                            record.startTime,
-                            record.endTime
-                        ),
-                    ),
-                )
-                for (stepRec in stepRequest.records) {
-                    totalSteps += stepRec.count
+                totalSteps = sumCompanionRecords(StepsRecord::class, record) {
+                    it.count.toDouble()
                 }
             } catch (e: SecurityException) {
                 Log.i(
