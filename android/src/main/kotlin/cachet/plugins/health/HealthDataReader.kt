@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Handler
 import android.util.Log
 import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.aggregate.AggregateMetric
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.*
 import androidx.health.connect.client.records.ExerciseRouteResult.ConsentRequired
@@ -570,6 +571,55 @@ class HealthDataReader(
     }
 
     /**
+     * Totals [metric] over [session]'s time range using Health Connect's
+     * aggregate API rather than a raw sum of records.
+     *
+     * A raw sum only counts records fully contained in the session's exact
+     * start/end instants, so a companion record that starts or ends outside
+     * that window by even a second is missed entirely - the workout then
+     * shows no distance at all. Aggregating prorates any record that merely
+     * overlaps the window, so a genuine partial reading is still counted.
+     *
+     * Only the session's own app is counted first, so another app (or the
+     * phone's own activity tracking) recording the same activity doesn't
+     * double the total. If the session's app contributed nothing for this
+     * metric, falls back to the single other app with the largest total
+     * rather than summing across apps - summing every app's total is what
+     * caused a Garmin run to be reported at roughly double its actual
+     * distance.
+     */
+    private suspend fun <T : Any> aggregateCompanionTotal(
+        metric: AggregateMetric<T>,
+        session: ExerciseSessionRecord,
+        toDouble: (T) -> Double,
+    ): Double {
+        val timeRange = TimeRangeFilter.between(session.startTime, session.endTime)
+
+        val ownResult = healthConnectClient.aggregate(
+            AggregateRequest(
+                metrics = setOf(metric),
+                timeRangeFilter = timeRange,
+                dataOriginFilter = setOf(session.metadata.dataOrigin),
+            ),
+        )[metric]
+        if (ownResult != null) return toDouble(ownResult)
+
+        val otherOrigins = healthConnectClient.aggregate(
+            AggregateRequest(metrics = setOf(metric), timeRangeFilter = timeRange),
+        ).dataOrigins.minus(session.metadata.dataOrigin)
+
+        return otherOrigins.mapNotNull { origin ->
+            healthConnectClient.aggregate(
+                AggregateRequest(
+                    metrics = setOf(metric),
+                    timeRangeFilter = timeRange,
+                    dataOriginFilter = setOf(origin),
+                ),
+            )[metric]?.let(toDouble)
+        }.maxOrNull() ?: 0.0
+    }
+
+    /**
      * Handles special processing for workout/exercise session data.
      * Enriches workout records with associated distance, energy, and step data
      * by querying related records within the workout time period.
@@ -600,18 +650,10 @@ class HealthDataReader(
             // whole workout read (see totalEnergyBurned/totalSteps below).
             var totalDistance = 0.0
             try {
-                val distanceRequest = healthConnectClient.readRecords(
-                    ReadRecordsRequest(
-                        recordType = DistanceRecord::class,
-                        timeRangeFilter = TimeRangeFilter.between(
-                            record.startTime,
-                            record.endTime,
-                        ),
-                    ),
-                )
-                for (distanceRec in distanceRequest.records) {
-                    totalDistance += distanceRec.distance.inMeters
-                }
+                totalDistance = aggregateCompanionTotal(
+                    DistanceRecord.DISTANCE_TOTAL,
+                    record,
+                ) { it.inMeters }
             } catch (e: SecurityException) {
                 Log.i(
                     "FLUTTER_HEALTH",
@@ -624,18 +666,10 @@ class HealthDataReader(
             // it must not abort the workout read, only leave the field null.
             var totalEnergyBurned = 0.0
             try {
-                val energyBurnedRequest = healthConnectClient.readRecords(
-                    ReadRecordsRequest(
-                        recordType = TotalCaloriesBurnedRecord::class,
-                        timeRangeFilter = TimeRangeFilter.between(
-                            record.startTime,
-                            record.endTime,
-                        ),
-                    ),
-                )
-                for (energyBurnedRec in energyBurnedRequest.records) {
-                    totalEnergyBurned += energyBurnedRec.energy.inKilocalories
-                }
+                totalEnergyBurned = aggregateCompanionTotal(
+                    TotalCaloriesBurnedRecord.ENERGY_TOTAL,
+                    record,
+                ) { it.inKilocalories }
             } catch (e: SecurityException) {
                 Log.i(
                     "FLUTTER_HEALTH",
@@ -648,18 +682,10 @@ class HealthDataReader(
             // abort the workout read, only leave the field null.
             var totalSteps = 0.0
             try {
-                val stepRequest = healthConnectClient.readRecords(
-                    ReadRecordsRequest(
-                        recordType = StepsRecord::class,
-                        timeRangeFilter = TimeRangeFilter.between(
-                            record.startTime,
-                            record.endTime
-                        ),
-                    ),
-                )
-                for (stepRec in stepRequest.records) {
-                    totalSteps += stepRec.count
-                }
+                totalSteps = aggregateCompanionTotal(
+                    StepsRecord.COUNT_TOTAL,
+                    record,
+                ) { it.toDouble() }
             } catch (e: SecurityException) {
                 Log.i(
                     "FLUTTER_HEALTH",
