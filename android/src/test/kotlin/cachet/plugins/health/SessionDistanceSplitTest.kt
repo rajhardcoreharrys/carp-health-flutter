@@ -27,6 +27,37 @@ class SessionDistanceSplitTest {
     }
 
     @Test
+    fun `gives each copy of a duplicated session the full distance`() {
+        val run = at(46)..at(57, 38)
+
+        val withDuplicateRecords = splitDistanceBySession(
+            sessions = listOf(run, run),
+            records = listOf(DistanceSample(run, 325.0), DistanceSample(run, 325.0)),
+        )
+        val withOneRecord = splitDistanceBySession(
+            sessions = listOf(run, run),
+            records = listOf(DistanceSample(run, 325.0)),
+        )
+
+        assertEquals(listOf(325.0, 325.0), withDuplicateRecords)
+        assertEquals(listOf(325.0, 325.0), withOneRecord)
+    }
+
+    @Test
+    fun `gives a record tied between sessions to the shorter one`() {
+        val hike = at(0)..at(59)
+        val walk = at(10)..at(20)
+
+        val meters = splitDistanceBySession(
+            sessions = listOf(hike, walk),
+            records = listOf(DistanceSample(hike, 5000.0), DistanceSample(walk, 1000.0)),
+        )
+
+        assertEquals(5000.0, meters[0], 0.01)
+        assertEquals(1000.0, meters[1], 0.01)
+    }
+
+    @Test
     fun `ignores records overlapping no session`() {
         val meters = splitDistanceBySession(
             sessions = listOf(at(46)..at(57, 38)),
