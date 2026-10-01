@@ -23,7 +23,14 @@ import kotlinx.coroutines.launch
 import java.time.Duration
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.reflect.KClass
+
+/** How far either side of overlapping sessions to read distance records, so one crossing a session's edge still counts pro rata. */
+private val SPLIT_READ_PADDING: Duration = Duration.ofHours(1)
+
+/** How far either side of a workout read by UUID to look for same-app sessions it may overlap. */
+private val SIBLING_SEARCH_PADDING: Duration = Duration.ofDays(1)
 
 /**
  * Handles reading and querying health data from Health Connect.
@@ -208,7 +215,12 @@ class HealthDataReader(
                     when (dataType) {
                         HealthConstants.WORKOUT -> {
                             val tempData = mutableListOf<Map<String, Any?>>()
-                            handleWorkoutData(listOf(matchingRecord), emptyList(), tempData)
+                            handleWorkoutData(
+                                listOf(matchingRecord),
+                                emptyList(),
+                                tempData,
+                                siblings = sameAppSessionsAround(matchingRecord as ExerciseSessionRecord),
+                            )
                             healthPoint = if (tempData.isNotEmpty()) tempData[0] else mapOf()
                         }
                         HealthConstants.SLEEP_SESSION,
@@ -622,47 +634,74 @@ class HealthDataReader(
     }
 
     /**
-     * Distance for a [session] that overlaps another of [sessions] from the
-     * same app, or null when it overlaps none.
+     * Distances for [sessions] that overlap another session from the same app,
+     * keyed by record id. Sessions missing from the map use the aggregate.
      *
      * Health Connect's aggregate removes overlap between one app's records, so
      * two overlapping sessions (e.g. Strava's own run and its copy of a Garmin
      * run) end up sharing one stretch of distance and the longer run comes out
-     * short. Here each of the app's records counts toward the session it
-     * overlaps most instead. Sessions without a same-app overlap keep the
-     * aggregate, which also stops an app's all-day distance being added on top
-     * of a workout's own.
+     * short. Here each group of overlapping same-app sessions reads its app's
+     * records once and splits them between the sessions (see
+     * [splitDistanceBySession]).
      */
-    private suspend fun sameAppOverlapDistance(
-        session: ExerciseSessionRecord,
-        sessions: List<Record>,
-    ): Double? {
-        val origin = session.metadata.dataOrigin
-        val others = sessions.filterIsInstance<ExerciseSessionRecord>().filter {
-            it !== session &&
-                it.metadata.dataOrigin == origin &&
-                it.startTime < session.endTime &&
-                session.startTime < it.endTime
+    private suspend fun sameAppSplitDistances(
+        sessions: List<ExerciseSessionRecord>,
+    ): Map<String, Double> {
+        val spans = sessions.map {
+            SessionSpan(it.metadata.id, it.metadata.dataOrigin.packageName, it.startTime..it.endTime)
         }
-        if (others.isEmpty()) return null
+        val distances = mutableMapOf<String, Double>()
 
-        val siblings = listOf(session) + others
-        // Padded so a record crossing a session's edge still counts pro rata.
-        val padding = Duration.ofHours(1)
-        val records = readAllRecords(
-            DistanceRecord::class,
-            TimeRangeFilter.between(
-                siblings.minOf { it.startTime }.minus(padding),
-                siblings.maxOf { it.endTime }.plus(padding),
-            ),
-            dataOriginFilter = setOf(origin),
-        )
+        for (group in overlappingSameAppGroups(spans)) {
+            // Caught broadly: a failed read (denied permission, rate limit)
+            // should only send this group back to the aggregate.
+            val records = try {
+                readAllRecords(
+                    DistanceRecord::class,
+                    TimeRangeFilter.between(
+                        group.minOf { it.time.start }.minus(SPLIT_READ_PADDING),
+                        group.maxOf { it.time.endInclusive }.plus(SPLIT_READ_PADDING),
+                    ),
+                    dataOriginFilter = setOf(DataOrigin(group.first().origin)),
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.i("FLUTTER_HEALTH", "Using the aggregate for overlapping workouts: ${e.message}")
+                continue
+            }
 
-        return splitDistanceBySession(
-            siblings.map { it.startTime..it.endTime },
-            records.map { DistanceSample(it.startTime..it.endTime, it.distance.inMeters) },
-        ).first().takeIf { it > 0 }
+            distances += groupDistances(
+                group,
+                records.map { DistanceSample(it.startTime..it.endTime, it.distance.inMeters) },
+            )
+        }
+        return distances
     }
+
+    /**
+     * Sessions from [session]'s app around it, so a workout read on its own
+     * can still be split from the sessions it overlaps. Empty if the read
+     * fails, leaving the workout on the aggregate.
+     */
+    private suspend fun sameAppSessionsAround(
+        session: ExerciseSessionRecord,
+    ): List<ExerciseSessionRecord> =
+        try {
+            readAllRecords(
+                ExerciseSessionRecord::class,
+                TimeRangeFilter.between(
+                    session.startTime.minus(SIBLING_SEARCH_PADDING),
+                    session.endTime.plus(SIBLING_SEARCH_PADDING),
+                ),
+                dataOriginFilter = setOf(session.metadata.dataOrigin),
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.i("FLUTTER_HEALTH", "Reading workout ${session.metadata.id} on its own: ${e.message}")
+            emptyList()
+        }
 
     /** Reads every page of [recordType] records matching the filters. */
     private suspend fun <T : Record> readAllRecords(
@@ -695,11 +734,13 @@ class HealthDataReader(
      * @param records List of ExerciseSessionRecord objects
      * @param recordingMethodsToFilter Recording methods to exclude (empty list means no filtering)
      * @param healthConnectData Mutable list to append processed workout data
+     * @param siblings Other sessions to split distance with, not added to the output
      */
     private suspend fun handleWorkoutData(
         records: List<Record>,
         recordingMethodsToFilter: List<Int> = emptyList(),
-        healthConnectData: MutableList<Map<String, Any?>>
+        healthConnectData: MutableList<Map<String, Any?>>,
+        siblings: List<ExerciseSessionRecord> = emptyList(),
     ) {
         val filteredRecords = if (recordingMethodsToFilter.isEmpty()) {
             records
@@ -710,6 +751,11 @@ class HealthDataReader(
             )
         }
 
+        val splitDistances = sameAppSplitDistances(
+            (filteredRecords.map { it as ExerciseSessionRecord } + siblings)
+                .distinctBy { it.metadata.id },
+        )
+
         for (rec in filteredRecords) {
             val record = rec as ExerciseSessionRecord
 
@@ -718,7 +764,7 @@ class HealthDataReader(
             // whole workout read (see totalEnergyBurned/totalSteps below).
             var totalDistance = 0.0
             try {
-                totalDistance = sameAppOverlapDistance(record, filteredRecords)
+                totalDistance = splitDistances[record.metadata.id]
                     ?: aggregateCompanionTotal(
                         DistanceRecord.DISTANCE_TOTAL,
                         record,
