@@ -10,6 +10,7 @@ import androidx.health.connect.client.records.*
 import androidx.health.connect.client.records.ExerciseRouteResult.ConsentRequired
 import androidx.health.connect.client.records.ExerciseRouteResult.Data
 import androidx.health.connect.client.records.ExerciseRouteResult.NoData
+import androidx.health.connect.client.records.metadata.DataOrigin
 import androidx.health.connect.client.request.AggregateGroupByDurationRequest
 import androidx.health.connect.client.request.AggregateRequest
 import androidx.health.connect.client.request.ReadRecordsRequest
@@ -22,6 +23,7 @@ import kotlinx.coroutines.launch
 import java.time.Duration
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import kotlin.reflect.KClass
 
 /**
  * Handles reading and querying health data from Health Connect.
@@ -620,6 +622,72 @@ class HealthDataReader(
     }
 
     /**
+     * Distance for a [session] that overlaps another of [sessions] from the
+     * same app, or null when it overlaps none.
+     *
+     * Health Connect's aggregate removes overlap between one app's records, so
+     * two overlapping sessions (e.g. Strava's own run and its copy of a Garmin
+     * run) end up sharing one stretch of distance and the longer run comes out
+     * short. Here each of the app's records counts toward the session it
+     * overlaps most instead. Sessions without a same-app overlap keep the
+     * aggregate, which also stops an app's all-day distance being added on top
+     * of a workout's own.
+     */
+    private suspend fun sameAppOverlapDistance(
+        session: ExerciseSessionRecord,
+        sessions: List<Record>,
+    ): Double? {
+        val origin = session.metadata.dataOrigin
+        val others = sessions.filterIsInstance<ExerciseSessionRecord>().filter {
+            it !== session &&
+                it.metadata.dataOrigin == origin &&
+                it.startTime < session.endTime &&
+                session.startTime < it.endTime
+        }
+        if (others.isEmpty()) return null
+
+        val siblings = listOf(session) + others
+        // Padded so a record crossing a session's edge still counts pro rata.
+        val padding = Duration.ofHours(1)
+        val records = readAllRecords(
+            DistanceRecord::class,
+            TimeRangeFilter.between(
+                siblings.minOf { it.startTime }.minus(padding),
+                siblings.maxOf { it.endTime }.plus(padding),
+            ),
+            dataOriginFilter = setOf(origin),
+        )
+
+        return splitDistanceBySession(
+            siblings.map { it.startTime..it.endTime },
+            records.map { DistanceSample(it.startTime..it.endTime, it.distance.inMeters) },
+        ).first().takeIf { it > 0 }
+    }
+
+    /** Reads every page of [recordType] records matching the filters. */
+    private suspend fun <T : Record> readAllRecords(
+        recordType: KClass<T>,
+        timeRangeFilter: TimeRangeFilter,
+        dataOriginFilter: Set<DataOrigin> = emptySet(),
+    ): List<T> {
+        val records = mutableListOf<T>()
+        var pageToken: String? = null
+        do {
+            val response = healthConnectClient.readRecords(
+                ReadRecordsRequest(
+                    recordType = recordType,
+                    timeRangeFilter = timeRangeFilter,
+                    dataOriginFilter = dataOriginFilter,
+                    pageToken = pageToken,
+                ),
+            )
+            records.addAll(response.records)
+            pageToken = response.pageToken
+        } while (!pageToken.isNullOrEmpty())
+        return records
+    }
+
+    /**
      * Handles special processing for workout/exercise session data.
      * Enriches workout records with associated distance, energy, and step data
      * by querying related records within the workout time period.
@@ -650,10 +718,11 @@ class HealthDataReader(
             // whole workout read (see totalEnergyBurned/totalSteps below).
             var totalDistance = 0.0
             try {
-                totalDistance = aggregateCompanionTotal(
-                    DistanceRecord.DISTANCE_TOTAL,
-                    record,
-                ) { it.inMeters }
+                totalDistance = sameAppOverlapDistance(record, filteredRecords)
+                    ?: aggregateCompanionTotal(
+                        DistanceRecord.DISTANCE_TOTAL,
+                        record,
+                    ) { it.inMeters }
             } catch (e: SecurityException) {
                 Log.i(
                     "FLUTTER_HEALTH",
