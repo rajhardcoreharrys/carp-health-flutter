@@ -2,12 +2,33 @@ package cachet.plugins.health
 
 import java.time.Duration
 import java.time.Instant
+import java.util.TreeSet
+
+/** A record counts as a whole session's when overlap over combined span is at least this. */
+private const val MATCH_THRESHOLD = 0.9
 
 /** A session's record id, the package of the app that wrote it, and its time span. */
 internal data class SessionSpan(val id: String, val origin: String, val time: ClosedRange<Instant>)
 
-/** A distance record's time span and the meters it covers. */
-internal data class DistanceSample(val time: ClosedRange<Instant>, val meters: Double)
+/** A distance record's id, time span, meters, and when it was last modified. */
+internal data class DistanceSample(
+    val id: String,
+    val time: ClosedRange<Instant>,
+    val meters: Double,
+    val lastModified: Instant,
+)
+
+/** Where a session in an overlapping same-app group takes its distance from. */
+internal sealed interface DistanceSource {
+    /** Meters worked out from the app's own records for the session. */
+    data class Own(val meters: Double) : DistanceSource
+
+    /** Health Connect's aggregate, the same as for a session with no overlap. */
+    data object Aggregate : DistanceSource
+
+    /** Only other apps' distance: the app's records here belong to a sibling. */
+    data object OtherApps : DistanceSource
+}
 
 /**
  * Groups of two or more [sessions] from the same app that overlap, directly
@@ -30,86 +51,92 @@ internal fun overlappingSameAppGroups(sessions: List<SessionSpan>): List<List<Se
     }
 
 /**
- * Each of a [group]'s sessions' meters from its app's distance [records],
- * keyed by session id.
+ * Where each of a [group]'s sessions takes its distance from, given its app's
+ * distance [records], keyed by session id.
  *
- * Empty when none of the records overlap the group, so the sessions fall back
- * to Health Connect's aggregate (and its other-app fallback). Otherwise every
- * session gets a value, including 0 m for one the app recorded no distance
- * for (e.g. a strength session overlapping a run), so it doesn't take its
- * sibling's distance from the aggregate.
+ * Health Connect doesn't link distance records to sessions, and its aggregate
+ * removes overlap between one app's records, so two overlapping sessions
+ * (e.g. Strava's own run and its copy of a Garmin run) share one stretch of
+ * distance. The only evidence a record belongs to one session is that it
+ * covers that session as a whole, as Strava's one record per activity does:
+ *
+ * - A session with such a record uses it ([DistanceSource.Own]).
+ * - A session without one keeps the aggregate, unless a record in its window
+ *   belongs to a sibling reaching outside it. It then uses the app's other
+ *   records there, or other apps' distance if there are none (e.g. a strength
+ *   session overlapping a run).
+ *
+ * So an app that writes distance in chunks keeps the aggregate throughout.
+ * Its overlapping sessions can't be told apart, whether they are a duplicate,
+ * a walk inside a hike, or two different activities.
  */
-internal fun groupDistances(
+internal fun planGroup(
     group: List<SessionSpan>,
     records: List<DistanceSample>,
-): Map<String, Double> {
-    val meters = splitDistanceBySession(group.map { it.time }, records)
-    if (meters.none { it > 0 }) return emptyMap()
-    return group.indices.associate { group[it].id to meters[it] }
-}
-
-/**
- * Splits one app's distance [records] between its overlapping [sessions],
- * returning each session's meters in the same order.
- *
- * Each record counts toward the session it overlaps most, pro rata, so two
- * overlapping sessions each keep their own distance. Records overlapping no
- * session are ignored.
- */
-internal fun splitDistanceBySession(
-    sessions: List<ClosedRange<Instant>>,
-    records: List<DistanceSample>,
-): List<Double> {
-    // An app writing the same session or record twice counts it once.
-    val spans = sessions.distinct()
-    val owned = List(spans.size) { mutableListOf<OwnedRecord>() }
-
-    for (record in records.distinct()) {
-        val overlaps = spans.map { overlapOf(it, record.time) }
-        val most = overlaps.maxOrNull() ?: continue
-        if (most <= Duration.ZERO) continue
-
-        // A tie goes to the shortest session, the one the record covers most
-        // of (e.g. a walk inside a hike), and is split if that still ties.
-        val tied = spans.indices.filter { overlaps[it] == most }
-        val shortest = tied.minOf { lengthOf(spans[it]) }
-        val owners = tied.filter { lengthOf(spans[it]) == shortest }
-        owners.forEach { owned[it] += OwnedRecord(record, share = 1.0 / owners.size) }
+): Map<String, DistanceSource> {
+    val matched = group.associate { session ->
+        session.id to records.filter { matches(it.time, session.time) }
     }
 
-    val meters = spans.mapIndexed { index, span -> metersWithin(span, owned[index]) }
-    return sessions.map { meters[spans.indexOf(it)] }
+    return group.associate { session ->
+        val own = matched.getValue(session.id)
+        if (own.isNotEmpty()) return@associate session.id to ownOrOtherApps(metersWithin(session.time, own))
+
+        val elsewhere = group
+            .filter { it.id != session.id && !within(it.time, session.time) }
+            .flatMap { matched.getValue(it.id) }
+            .mapTo(mutableSetOf()) { it.id }
+        val inWindow = records.filter { overlapOf(it.time, session.time) > Duration.ZERO }
+        if (inWindow.none { it.id in elsewhere }) return@associate session.id to DistanceSource.Aggregate
+
+        session.id to ownOrOtherApps(metersWithin(session.time, inWindow.filter { it.id !in elsewhere }))
+    }
 }
 
-private class OwnedRecord(val record: DistanceSample, share: Double) {
-    /** Meters per nanosecond. */
-    val rate = record.meters * share / lengthOf(record.time).toNanos()
+private fun ownOrOtherApps(meters: Double): DistanceSource =
+    if (meters > 0) DistanceSource.Own(meters) else DistanceSource.OtherApps
+
+private fun matches(record: ClosedRange<Instant>, session: ClosedRange<Instant>): Boolean {
+    val union = Duration.between(
+        minOf(record.start, session.start),
+        maxOf(record.endInclusive, session.endInclusive),
+    )
+    if (union <= Duration.ZERO) return false
+    return overlapOf(record, session).toNanos().toDouble() / union.toNanos() >= MATCH_THRESHOLD
 }
+
+private val newestFirst =
+    compareByDescending<DistanceSample> { it.lastModified }.thenByDescending { it.id }
 
 /**
- * Meters [records] cover within [span], counting time where they overlap
- * once, as Health Connect's aggregate does, so an app's all-day pedometer
- * distance isn't added to a workout's own. Where records overlap, the one
- * overlapping [span] most counts (the workout's own record over pedometer
- * chunks), then the faster.
+ * Meters [records] cover within [span], counting time where they overlap once
+ * as Health Connect does within one app: the most recently modified record.
  */
-private fun metersWithin(span: ClosedRange<Instant>, records: List<OwnedRecord>): Double {
-    val bounds = records
-        .flatMap { listOf(it.record.time.start, it.record.time.endInclusive) }
+private fun metersWithin(span: ClosedRange<Instant>, records: List<DistanceSample>): Double {
+    val inSpan = records.filter { overlapOf(it.time, span) > Duration.ZERO }
+    val byStart = inSpan.sortedBy { it.time.start }
+    val byEnd = inSpan.sortedBy { it.time.endInclusive }
+    val bounds = inSpan
+        .flatMap { listOf(it.time.start, it.time.endInclusive) }
         .map { it.coerceIn(span.start, span.endInclusive) }
         .distinct()
         .sorted()
 
+    val active = TreeSet(newestFirst)
+    var started = 0
+    var ended = 0
     var meters = 0.0
     for ((from, to) in bounds.zipWithNext()) {
-        val counted = records
-            .filter { it.record.time.start <= from && to <= it.record.time.endInclusive }
-            .maxWithOrNull(compareBy({ overlapOf(span, it.record.time) }, { it.rate }))
-            ?: continue
-        meters += counted.rate * Duration.between(from, to).toNanos()
+        while (started < byStart.size && byStart[started].time.start <= from) active += byStart[started++]
+        while (ended < byEnd.size && byEnd[ended].time.endInclusive <= from) active -= byEnd[ended++]
+        val newest = active.firstOrNull() ?: continue
+        meters += newest.meters * Duration.between(from, to).toNanos() / lengthOf(newest.time).toNanos()
     }
     return meters
 }
+
+private fun within(inner: ClosedRange<Instant>, outer: ClosedRange<Instant>): Boolean =
+    inner.start >= outer.start && inner.endInclusive <= outer.endInclusive
 
 private fun lengthOf(span: ClosedRange<Instant>): Duration =
     Duration.between(span.start, span.endInclusive)

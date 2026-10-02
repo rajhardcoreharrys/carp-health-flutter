@@ -19,7 +19,9 @@ import androidx.health.connect.client.units.*
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel.Result
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.time.Duration
 import java.time.Instant
 import java.time.temporal.ChronoUnit
@@ -29,7 +31,7 @@ import kotlin.reflect.KClass
 /** How far either side of overlapping sessions to read distance records, so one crossing a session's edge still counts pro rata. */
 private val SPLIT_READ_PADDING: Duration = Duration.ofHours(1)
 
-/** How far either side of a workout read by UUID to look for same-app sessions it may overlap. */
+/** How far outside a workout read by UUID, or a read window, to look for sessions it may overlap. */
 private val SIBLING_SEARCH_PADDING: Duration = Duration.ofDays(1)
 
 /**
@@ -117,7 +119,17 @@ class HealthDataReader(
 
                     // Handle special cases
                     when (dataType) {
-                        WORKOUT -> handleWorkoutData(records, recordingMethodsToFilter, healthConnectData)
+                        WORKOUT -> handleWorkoutData(
+                            records,
+                            recordingMethodsToFilter,
+                            healthConnectData,
+                            siblings = sessionsAroundWindow(
+                                startTime,
+                                endTime,
+                                records,
+                                recordingMethodsToFilter,
+                            ),
+                        )
                         SLEEP_SESSION, SLEEP_ASLEEP, SLEEP_AWAKE, SLEEP_AWAKE_IN_BED, 
                         SLEEP_LIGHT, SLEEP_DEEP, SLEEP_REM, SLEEP_OUT_OF_BED, SLEEP_UNKNOWN -> 
                             handleSleepData(records, recordingMethodsToFilter, dataType, healthConnectData)
@@ -618,6 +630,19 @@ class HealthDataReader(
         )[metric]
         if (ownResult != null) return toDouble(ownResult)
 
+        return otherAppsTotal(metric, session, toDouble)
+    }
+
+    /**
+     * Totals [metric] over [session]'s time range from the single other app
+     * with the largest total, leaving out the session's own app.
+     */
+    private suspend fun <T : Any> otherAppsTotal(
+        metric: AggregateMetric<T>,
+        session: ExerciseSessionRecord,
+        toDouble: (T) -> Double,
+    ): Double {
+        val timeRange = TimeRangeFilter.between(session.startTime, session.endTime)
         val otherOrigins = healthConnectClient.aggregate(
             AggregateRequest(metrics = setOf(metric), timeRangeFilter = timeRange),
         ).dataOrigins.minus(session.metadata.dataOrigin)
@@ -634,36 +659,55 @@ class HealthDataReader(
     }
 
     /**
-     * Distances for [sessions] that overlap another session from the same app,
-     * keyed by record id. Sessions missing from the map use the aggregate.
+     * Where [sessions] that overlap another session from the same app take
+     * their distance from (see [planGroup]), keyed by record id. Sessions
+     * missing from the map use the aggregate.
      *
-     * Health Connect's aggregate removes overlap between one app's records, so
-     * two overlapping sessions (e.g. Strava's own run and its copy of a Garmin
-     * run) end up sharing one stretch of distance and the longer run comes out
-     * short. Here each group of overlapping same-app sessions reads its app's
-     * records once and splits them between the sessions (see
-     * [splitDistanceBySession]).
+     * [siblings] are grouped too but only matter for groups that include one
+     * of [sessions], so no records are read for a group of siblings alone.
      */
-    private suspend fun sameAppSplitDistances(
+    private suspend fun sameAppDistanceSources(
         sessions: List<ExerciseSessionRecord>,
-    ): Map<String, Double> {
-        val spans = sessions.map {
+        siblings: List<ExerciseSessionRecord>,
+    ): Map<String, DistanceSource> {
+        val ids = sessions.mapTo(mutableSetOf()) { it.metadata.id }
+        val spans = (sessions + siblings).distinctBy { it.metadata.id }.map {
             SessionSpan(it.metadata.id, it.metadata.dataOrigin.packageName, it.startTime..it.endTime)
         }
-        val distances = mutableMapOf<String, Double>()
+        val sources = mutableMapOf<String, DistanceSource>()
 
         for (group in overlappingSameAppGroups(spans)) {
+            if (group.none { it.id in ids }) continue
+
+            val origin = DataOrigin(group.first().origin)
+            val start = group.minOf { it.time.start }
+            val end = group.maxOf { it.time.endInclusive }
+
             // Caught broadly: a failed read (denied permission, rate limit)
             // should only send this group back to the aggregate.
-            val records = try {
-                readAllRecords(
+            val plan = try {
+                val records = readAllRecords(
                     DistanceRecord::class,
-                    TimeRangeFilter.between(
-                        group.minOf { it.time.start }.minus(SPLIT_READ_PADDING),
-                        group.maxOf { it.time.endInclusive }.plus(SPLIT_READ_PADDING),
-                    ),
-                    dataOriginFilter = setOf(DataOrigin(group.first().origin)),
-                )
+                    TimeRangeFilter.between(start.minus(SPLIT_READ_PADDING), end.plus(SPLIT_READ_PADDING)),
+                    dataOriginFilter = setOf(origin),
+                ).map {
+                    DistanceSample(
+                        it.metadata.id,
+                        it.startTime..it.endTime,
+                        it.distance.inMeters,
+                        it.metadata.lastModifiedTime,
+                    )
+                }
+                val plan = withContext(Dispatchers.Default) { planGroup(group, records) }
+
+                // The aggregate leaves out an app the user removed from Health
+                // Connect's priority list, so leave its sessions to it as well.
+                if (plan.values.any { it != DistanceSource.Aggregate } &&
+                    !isInPriorityList(origin, start, end)
+                ) {
+                    continue
+                }
+                plan
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -671,12 +715,66 @@ class HealthDataReader(
                 continue
             }
 
-            distances += groupDistances(
-                group,
-                records.map { DistanceSample(it.startTime..it.endTime, it.distance.inMeters) },
-            )
+            sources += plan
         }
-        return distances
+        return sources
+    }
+
+    /**
+     * Whether Health Connect's aggregate counts [origin]'s distance between
+     * [start] and [end]. Called once the app is known to have records there,
+     * so no total means the user took it out of the priority list.
+     */
+    private suspend fun isInPriorityList(origin: DataOrigin, start: Instant, end: Instant): Boolean =
+        healthConnectClient.aggregate(
+            AggregateRequest(
+                metrics = setOf(DistanceRecord.DISTANCE_TOTAL),
+                timeRangeFilter = TimeRangeFilter.between(start, end),
+                dataOriginFilter = setOf(origin),
+            ),
+        )[DistanceRecord.DISTANCE_TOTAL] != null
+
+    /**
+     * Sessions just outside a read window that may overlap sessions in it.
+     * Health Connect returns sessions by start time, so a same-app copy that
+     * started before the window, or after it beside a session running past its
+     * end, isn't among [sessions]. Empty if the read fails.
+     */
+    private suspend fun sessionsAroundWindow(
+        startTime: Instant,
+        endTime: Instant,
+        sessions: List<Record>,
+        recordingMethodsToFilter: List<Int>,
+    ): List<ExerciseSessionRecord> {
+        if (sessions.isEmpty()) return emptyList()
+        return try {
+            val before = readAllRecords(
+                ExerciseSessionRecord::class,
+                TimeRangeFilter.between(startTime.minus(SIBLING_SEARCH_PADDING), startTime),
+            )
+            val after = if (sessions.any { (it as ExerciseSessionRecord).endTime > endTime }) {
+                readAllRecords(
+                    ExerciseSessionRecord::class,
+                    TimeRangeFilter.between(endTime, endTime.plus(SIBLING_SEARCH_PADDING)),
+                )
+            } else {
+                emptyList()
+            }
+
+            if (recordingMethodsToFilter.isEmpty()) {
+                before + after
+            } else {
+                recordingFilter.filterRecordsByRecordingMethods(
+                    recordingMethodsToFilter,
+                    before + after,
+                ).map { it as ExerciseSessionRecord }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.i("FLUTTER_HEALTH", "Skipping sessions around the read window: ${e.message}")
+            emptyList()
+        }
     }
 
     /**
@@ -751,25 +849,30 @@ class HealthDataReader(
             )
         }
 
-        val splitDistances = sameAppSplitDistances(
-            (filteredRecords.map { it as ExerciseSessionRecord } + siblings)
-                .distinctBy { it.metadata.id },
+        val distanceSources = sameAppDistanceSources(
+            filteredRecords.map { it as ExerciseSessionRecord },
+            siblings,
         )
 
         for (rec in filteredRecords) {
             val record = rec as ExerciseSessionRecord
 
-            // Get distance data. Caught individually: a denied READ_DISTANCE
-            // permission should only leave totalDistance null, not abort the
-            // whole workout read (see totalEnergyBurned/totalSteps below).
+            // Get distance data. Caught individually and broadly: a denied
+            // READ_DISTANCE permission or a rate limit should only leave
+            // totalDistance null, not abort the whole workout read (see
+            // totalEnergyBurned/totalSteps below).
             var totalDistance = 0.0
             try {
-                totalDistance = splitDistances[record.metadata.id]
-                    ?: aggregateCompanionTotal(
-                        DistanceRecord.DISTANCE_TOTAL,
-                        record,
-                    ) { it.inMeters }
-            } catch (e: SecurityException) {
+                totalDistance = when (val source = distanceSources[record.metadata.id]) {
+                    is DistanceSource.Own -> source.meters
+                    DistanceSource.OtherApps ->
+                        otherAppsTotal(DistanceRecord.DISTANCE_TOTAL, record) { it.inMeters }
+                    DistanceSource.Aggregate, null ->
+                        aggregateCompanionTotal(DistanceRecord.DISTANCE_TOTAL, record) { it.inMeters }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
                 Log.i(
                     "FLUTTER_HEALTH",
                     "Skipping distance enrichment for workout ${record.metadata.id}: ${e.message}"
@@ -785,7 +888,9 @@ class HealthDataReader(
                     TotalCaloriesBurnedRecord.ENERGY_TOTAL,
                     record,
                 ) { it.inKilocalories }
-            } catch (e: SecurityException) {
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
                 Log.i(
                     "FLUTTER_HEALTH",
                     "Skipping energy-burned enrichment for workout ${record.metadata.id}: ${e.message}"
@@ -801,7 +906,9 @@ class HealthDataReader(
                     StepsRecord.COUNT_TOTAL,
                     record,
                 ) { it.toDouble() }
-            } catch (e: SecurityException) {
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
                 Log.i(
                     "FLUTTER_HEALTH",
                     "Skipping steps enrichment for workout ${record.metadata.id}: ${e.message}"
